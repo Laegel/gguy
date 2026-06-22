@@ -925,6 +925,7 @@ dependencies = [
  "pollster",
  "vello",
  "wgpu",
+ "wgpu-hal",
  "wgpu_context",
 ]
 

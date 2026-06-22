@@ -6,7 +6,11 @@ edition = "2024"
 [lib]
 crate-type = ["rlib"]
 
+[features]
+vulkan-interop = ["dep:wgpu-hal"]
+
 [dependencies]
+wgpu-hal = { version = "29.0.3", optional = true, features = ["vulkan"] }
 blitz-dom = { version = "=0.3.0-alpha.5", default-features = false, features = ["system_fonts", "woff"] }
 blitz-html = "=0.3.0-alpha.5"
 blitz-paint = "=0.3.0-alpha.5"

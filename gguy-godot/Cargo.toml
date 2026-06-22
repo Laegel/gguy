@@ -6,6 +6,9 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+vulkan-interop = ["gguy-core/vulkan-interop"]
+
 [dependencies]
 godot = { version = "=0.5.3", features = ["api-4-4"] }
 gguy-core = { path = "../gguy-core" }
