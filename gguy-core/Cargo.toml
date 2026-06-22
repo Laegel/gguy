@@ -1,0 +1,22 @@
+[package]
+name = "gguy-core"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+blitz-dom = { version = "=0.3.0-alpha.5", default-features = false, features = ["system_fonts", "woff"] }
+blitz-html = "=0.3.0-alpha.5"
+blitz-paint = "=0.3.0-alpha.5"
+blitz-traits = "=0.3.0-alpha.5"
+anyrender_vello = "0.11.0"
+keyboard-types = "0.7"
+vello = "0.9.0"
+wgpu = "29.0.3"
+wgpu_context = "0.6.0"
+pollster = "0.4.0"
+
+[dev-dependencies]
+image = "0.25.6"
