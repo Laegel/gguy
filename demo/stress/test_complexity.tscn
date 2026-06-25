@@ -1,0 +1,21 @@
+[gd_scene load_steps=1 format=3]
+[ext_resource type="Script" path="res://stress/test_complexity.gd" id="1"]
+
+[node name="Control" type="Control"]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1")
+
+[node name="TextureRect" type="TextureRect" parent="."]
+unique_name_in_owner = true
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+stretch_mode = 2
+
+[node name="GguySurface" type="GguySurface" parent="."]
