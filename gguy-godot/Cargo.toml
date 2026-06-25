@@ -12,3 +12,4 @@ vulkan-interop = ["gguy-core/vulkan-interop"]
 [dependencies]
 godot = { version = "=0.5.3", features = ["api-4-4"] }
 gguy-core = { path = "../gguy-core" }
+keyboard-types = "0.7"

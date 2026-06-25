@@ -1,3 +1,5 @@
+use keyboard_types::{Code, Modifiers};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointerButton {
     Primary,
@@ -19,23 +21,31 @@ pub enum InputEvent {
     PointerDown {
         coords: PointerCoords,
         button: PointerButton,
+        modifiers: Modifiers,
     },
     PointerUp {
         coords: PointerCoords,
         button: PointerButton,
+        modifiers: Modifiers,
     },
     PointerMove {
         coords: PointerCoords,
+        modifiers: Modifiers,
     },
     Scroll {
         delta_x: f64,
         delta_y: f64,
+        modifiers: Modifiers,
     },
     KeyDown {
         key: String,
+        code: Code,
+        modifiers: Modifiers,
     },
     KeyUp {
         key: String,
+        code: Code,
+        modifiers: Modifiers,
     },
     TextInput {
         text: String,

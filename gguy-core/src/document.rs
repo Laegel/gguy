@@ -202,9 +202,10 @@ impl Document {
 
     pub fn handle_input_event(&mut self, event: &InputEvent) {
         let ui_event = match *event {
-            InputEvent::PointerMove { coords } => {
+            InputEvent::PointerMove { coords, modifiers } => {
                 let x = coords.x;
                 let y = coords.y;
+                self.log_msg(LogLevel::Info, format_args!("[document] PointerMove set_hover_to({}, {})", x, y));
                 self.html_doc.set_hover_to(x as f32, y as f32);
                 UiEvent::PointerMove(BlitzPointerEvent {
                     id: blitz_traits::events::BlitzPointerId::Mouse,
@@ -212,7 +213,7 @@ impl Document {
                     coords: make_coords(x, y),
                     button: MouseEventButton::Main,
                     buttons: Default::default(),
-                    mods: Modifiers::empty(),
+                    mods: modifiers,
                     details: PointerDetails {
                         pressure: 0.0,
                         tangential_pressure: 0.0,
@@ -224,24 +225,28 @@ impl Document {
                     },
                 })
             }
-            InputEvent::PointerDown { coords, button } => {
-                UiEvent::PointerDown(make_pointer_event(coords.x, coords.y, button))
+            InputEvent::PointerDown { coords, button, modifiers } => {
+                let mut ev = make_pointer_event(coords.x, coords.y, button);
+                ev.mods = modifiers;
+                UiEvent::PointerDown(ev)
             }
-            InputEvent::PointerUp { coords, button } => {
-                UiEvent::PointerUp(make_pointer_event(coords.x, coords.y, button))
+            InputEvent::PointerUp { coords, button, modifiers } => {
+                let mut ev = make_pointer_event(coords.x, coords.y, button);
+                ev.mods = modifiers;
+                UiEvent::PointerUp(ev)
             }
-            InputEvent::Scroll { delta_x, delta_y } => UiEvent::Wheel(BlitzWheelEvent {
+            InputEvent::Scroll { delta_x, delta_y, modifiers } => UiEvent::Wheel(BlitzWheelEvent {
                 delta: BlitzWheelDelta::Pixels(delta_x as f64, delta_y as f64),
                 coords: make_coords(0.0, 0.0),
                 buttons: Default::default(),
-                mods: Modifiers::empty(),
+                mods: modifiers,
             }),
-            InputEvent::KeyDown { ref key } => {
+            InputEvent::KeyDown { ref key, code, modifiers } => {
                 let k = Key::Character(key.clone());
                 UiEvent::KeyDown(BlitzKeyEvent {
                     key: k,
-                    code: Code::Unidentified,
-                    modifiers: Modifiers::empty(),
+                    code,
+                    modifiers,
                     location: Location::Standard,
                     is_auto_repeating: false,
                     is_composing: false,
@@ -249,12 +254,12 @@ impl Document {
                     text: None,
                 })
             }
-            InputEvent::KeyUp { ref key } => {
+            InputEvent::KeyUp { ref key, code, modifiers } => {
                 let k = Key::Character(key.clone());
                 UiEvent::KeyUp(BlitzKeyEvent {
                     key: k,
-                    code: Code::Unidentified,
-                    modifiers: Modifiers::empty(),
+                    code,
+                    modifiers,
                     location: Location::Standard,
                     is_auto_repeating: false,
                     is_composing: false,
@@ -262,7 +267,18 @@ impl Document {
                     text: None,
                 })
             }
-            InputEvent::TextInput { .. } => return,
+            InputEvent::TextInput { ref text } => {
+                UiEvent::KeyDown(BlitzKeyEvent {
+                    key: Key::Character(text.clone()),
+                    code: Code::Unidentified,
+                    modifiers: Modifiers::empty(),
+                    location: Location::Standard,
+                    is_auto_repeating: false,
+                    is_composing: false,
+                    state: blitz_traits::events::KeyState::Pressed,
+                    text: Some(text.clone().into()),
+                })
+            }
         };
 
         self.html_doc.handle_ui_event(ui_event);

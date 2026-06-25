@@ -935,6 +935,7 @@ version = "0.1.0"
 dependencies = [
  "gguy-core",
  "godot",
+ "keyboard-types",
 ]
 
 [[package]]
