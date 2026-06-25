@@ -156,18 +156,6 @@ impl GguySurface {
         self.gpu_texture.clone().unwrap_or_else(Texture2Drd::new_gd)
     }
 
-    // ── Layer 0: VDOM diff layer ──────────────────────────────────────────
-
-    #[func]
-    pub fn render(&mut self, tree: VarDictionary) {
-        api::layer0_vdom::render(self, tree);
-    }
-
-    #[func]
-    pub fn render_into(&mut self, container_id: GString, tree: VarDictionary) {
-        api::layer0_vdom::render_into(self, &container_id.to_string(), tree);
-    }
-
     // ── Layer 1: Low-level mutation API ────────────────────────────────────
 
     #[func]
@@ -193,6 +181,16 @@ impl GguySurface {
     #[func]
     pub fn remove_class(&mut self, selector: GString, class: GString) {
         api::layer1_mutation::remove_class(self, &selector.to_string(), &class.to_string());
+    }
+
+    #[func]
+    pub fn create_element(&mut self, parent_selector: GString, tag: GString, attrs: VarDictionary) -> i64 {
+        api::layer1_mutation::create_element(self, &parent_selector.to_string(), &tag.to_string(), &attrs)
+    }
+
+    #[func]
+    pub fn remove_element(&mut self, selector: GString) {
+        api::layer1_mutation::remove_element(self, &selector.to_string());
     }
 
     fn update_texture(&mut self) {

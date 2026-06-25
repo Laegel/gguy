@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fmt;
 use std::time::Instant;
 
@@ -19,34 +18,6 @@ use vello::Scene;
 
 use crate::input::{InputEvent, PointerButton};
 use crate::traits::{EventSink, ResourceProvider};
-
-#[derive(Debug, Clone)]
-pub struct NodeDescriptor {
-    pub tag: String,
-    pub attrs: Vec<(String, String)>,
-    pub children: Vec<NodeDescriptor>,
-    pub text: Option<String>,
-}
-
-impl NodeDescriptor {
-    pub fn element(tag: &str, attrs: Vec<(String, String)>, children: Vec<NodeDescriptor>) -> Self {
-        Self {
-            tag: tag.to_string(),
-            attrs,
-            children,
-            text: None,
-        }
-    }
-
-    pub fn text(text: &str) -> Self {
-        Self {
-            tag: String::new(),
-            attrs: vec![],
-            children: vec![],
-            text: Some(text.to_string()),
-        }
-    }
-}
 
 pub struct Document {
     html_doc: HtmlDocument,
@@ -416,200 +387,40 @@ impl Document {
         self.needs_paint = true;
     }
 
-    // ── Layer 0: VDOM reconciliation ──────────────────────────────────────
+    // ── Element creation / removal ────────────────────────────────────────
 
-    pub fn reconcile(
-        &mut self,
-        container_id: Option<&str>,
-        descriptors: &[NodeDescriptor],
-    ) {
-        let _t = Instant::now();
+    pub fn create_element_by_id(&mut self, parent_id: &str, tag: &str, attrs: &[(String, String)]) -> Option<usize> {
+        let nid = self.html_doc.get_element_by_id(parent_id)?;
+        Some(self.create_element_by_node_id(nid, tag, attrs))
+    }
 
-        let container = container_id
-            .and_then(|id| self.html_doc.get_element_by_id(id))
-            .or_else(|| self.find_body());
-
-        let container_id = match container {
-            Some(cid) => cid,
-            None => {
-                self.log_msg(LogLevel::Warn, format_args!("[gguy] reconcile: no container found (body missing)"));
-                return;
-            }
-        };
-
-        let old_child_ids: Vec<usize> = self.html_doc
-            .get_node(container_id)
-            .map(|n| n.children.clone())
-            .unwrap_or_default();
-
-        let plans: Vec<Plan> = descriptors
+    pub fn create_element_by_node_id(&mut self, parent_node_id: usize, tag: &str, attrs: &[(String, String)]) -> usize {
+        let blitz_attrs: Vec<blitz_dom::Attribute> = attrs
             .iter()
-            .map(|desc| Plan::resolve(desc, &self.html_doc))
+            .map(|(name, value)| blitz_dom::Attribute {
+                name: qual(name),
+                value: value.clone(),
+            })
             .collect();
 
-        let plan_us = _t.elapsed().as_micros();
-
         let mut mutator = self.html_doc.mutate();
-        let mut kept: HashSet<usize> = HashSet::new();
-        let mut new_order: Vec<usize> = Vec::new();
-
-        for plan in &plans {
-            if let Some(node_id) = plan.existing {
-                kept.insert(node_id);
-                new_order.push(node_id);
-                update_node(&mut mutator, node_id, plan);
-            } else {
-                let new_id = create_node_from_plan(&mut mutator, plan);
-                new_order.push(new_id);
-            }
-        }
-
-        for &old_id in &old_child_ids {
-            if !kept.contains(&old_id) {
-                mutator.remove_and_drop_node(old_id);
-            }
-        }
-
-        // Reorder children to match descriptor order: remove existing ones
-        // from current positions, then re-append all in the new order.
-        for &node_id in &new_order {
-            if kept.contains(&node_id) {
-                mutator.remove_node(node_id);
-            }
-        }
-        for &node_id in &new_order {
-            mutator.append_children(container_id, &[node_id]);
-        }
-
+        let node_id = mutator.create_element(qual(tag), blitz_attrs);
+        mutator.append_children(parent_node_id, &[node_id]);
         drop(mutator);
-
-        let mutate_us = _t.elapsed().as_micros() - plan_us;
-
         self.needs_paint = true;
-
-        self.log_msg(LogLevel::Profile, format_args!("[profile] reconcile: total={}µs  plan={}µs  mutate={}µs  descs={}",
-            _t.elapsed().as_micros(), plan_us, mutate_us, descriptors.len()));
+        node_id
     }
 
-    fn find_body(&self) -> Option<usize> {
-        self.html_doc.query_selector("body").ok()?
-    }
-}
-
-// ── Plan — a resolved descriptor with pre-computed id lookups ──────────────
-
-struct Plan {
-    existing: Option<usize>,
-    tag: String,
-    attrs: Vec<(String, String)>,
-    children: Vec<NodeDescriptor>,
-    is_text: bool,
-    text: Option<String>,
-}
-
-impl Plan {
-    fn resolve(desc: &NodeDescriptor, doc: &HtmlDocument) -> Self {
-        let id_attr = desc
-            .attrs
-            .iter()
-            .find(|(k, _)| k == "id")
-            .and_then(|(_, v)| doc.get_element_by_id(v));
-        Self {
-            existing: id_attr,
-            tag: desc.tag.clone(),
-            attrs: desc.attrs.clone(),
-            children: desc.children.clone(),
-            is_text: desc.text.is_some(),
-            text: desc.text.clone(),
-        }
-    }
-}
-
-// ── Plan application helpers (operate inside a mutator scope) ──────────────
-
-fn update_node(mutator: &mut blitz_dom::DocumentMutator, node_id: usize, plan: &Plan) {
-    for (name, value) in &plan.attrs {
-        mutator.set_attribute(node_id, qual(name), value);
-    }
-
-    let old_child_ids: Vec<usize> = mutator.child_ids(node_id);
-    let mut kept: HashSet<usize> = HashSet::new();
-
-    for child_desc in &plan.children {
-        let child_plan = Plan {
-            existing: child_desc
-                .attrs
-                .iter()
-                .find(|(k, _)| k == "id")
-                .and_then(|(_, id_val)| {
-                    old_child_ids.iter().copied().find(|&cid| {
-                        mutator
-                            .doc
-                            .get_node(cid)
-                            .and_then(|n| n.attr(local_name!("id")))
-                            .map(|a| a == id_val.as_str())
-                            .unwrap_or(false)
-                    })
-                }),
-            tag: child_desc.tag.clone(),
-            attrs: child_desc.attrs.clone(),
-            children: child_desc.children.clone(),
-            is_text: child_desc.text.is_some(),
-            text: child_desc.text.clone(),
-        };
-
-        let child_id = if let Some(cid) = child_plan.existing {
-            kept.insert(cid);
-            update_node(mutator, cid, &child_plan);
-            cid
-        } else {
-            let new_id = create_node_from_plan(mutator, &child_plan);
-            mutator.append_children(node_id, &[new_id]);
-            new_id
-        };
-
-        if child_plan.existing.is_some() {
-            mutator.remove_node(child_id);
-            mutator.append_children(node_id, &[child_id]);
+    pub fn remove_node_by_id(&mut self, id: &str) {
+        if let Some(node_id) = self.html_doc.get_element_by_id(id) {
+            self.remove_node_by_node_id(node_id);
         }
     }
 
-    for &cid in &old_child_ids {
-        if !kept.contains(&cid) {
-            mutator.remove_and_drop_node(cid);
-        }
+    pub fn remove_node_by_node_id(&mut self, node_id: usize) {
+        let mut mutator = self.html_doc.mutate();
+        mutator.remove_and_drop_node(node_id);
+        drop(mutator);
+        self.needs_paint = true;
     }
-}
-
-fn create_node_from_plan(mutator: &mut blitz_dom::DocumentMutator, plan: &Plan) -> usize {
-    if plan.is_text {
-        let text = plan.text.as_deref().unwrap_or("");
-        return mutator.create_text_node(text);
-    }
-
-    let blitz_attrs: Vec<blitz_dom::Attribute> = plan
-        .attrs
-        .iter()
-        .map(|(name, value)| blitz_dom::Attribute {
-            name: qual(name),
-            value: value.clone(),
-        })
-        .collect();
-
-    let node_id = mutator.create_element(qual(&plan.tag), blitz_attrs);
-
-    for child in &plan.children {
-        let child_plan = Plan {
-            existing: None,
-            tag: child.tag.clone(),
-            attrs: child.attrs.clone(),
-            children: child.children.clone(),
-            is_text: child.text.is_some(),
-            text: child.text.clone(),
-        };
-        let child_id = create_node_from_plan(mutator, &child_plan);
-        mutator.append_children(node_id, &[child_id]);
-    }
-
-    node_id
 }
