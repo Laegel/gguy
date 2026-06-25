@@ -1,25 +1,62 @@
+use std::collections::HashSet;
+use std::fmt;
+use std::time::Instant;
+
 use anyrender_vello::VelloScenePainter;
 use blitz_dom::Document as _;
 use blitz_dom::DocumentConfig;
 use blitz_html::HtmlDocument;
+
+use crate::log::{LogLevel, Logger};
 use blitz_traits::events::{
     BlitzKeyEvent, BlitzPointerEvent, BlitzWheelDelta, BlitzWheelEvent, MouseEventButton,
     PointerCoords, PointerDetails, UiEvent,
 };
 use blitz_traits::shell::{ColorScheme, Viewport};
 use keyboard_types::{Code, Key, Location, Modifiers};
+use blitz_dom::{LocalName, QualName, local_name, ns};
 use vello::Scene;
 
 use crate::input::{InputEvent, PointerButton};
 use crate::traits::{EventSink, ResourceProvider};
+
+#[derive(Debug, Clone)]
+pub struct NodeDescriptor {
+    pub tag: String,
+    pub attrs: Vec<(String, String)>,
+    pub children: Vec<NodeDescriptor>,
+    pub text: Option<String>,
+}
+
+impl NodeDescriptor {
+    pub fn element(tag: &str, attrs: Vec<(String, String)>, children: Vec<NodeDescriptor>) -> Self {
+        Self {
+            tag: tag.to_string(),
+            attrs,
+            children,
+            text: None,
+        }
+    }
+
+    pub fn text(text: &str) -> Self {
+        Self {
+            tag: String::new(),
+            attrs: vec![],
+            children: vec![],
+            text: Some(text.to_string()),
+        }
+    }
+}
 
 pub struct Document {
     html_doc: HtmlDocument,
     width: u32,
     height: u32,
     scale: f64,
+    needs_paint: bool,
     resource_provider: Option<Box<dyn ResourceProvider>>,
     event_sink: Option<Box<dyn EventSink>>,
+    logger: Option<Box<dyn Logger>>,
 }
 
 fn map_button(btn: PointerButton) -> MouseEventButton {
@@ -64,6 +101,10 @@ fn make_pointer_event(x: f64, y: f64, button: PointerButton) -> BlitzPointerEven
     }
 }
 
+fn qual(name: &str) -> QualName {
+    QualName::new(None, ns!(html), LocalName::from(name))
+}
+
 impl Document {
     pub fn new(html: &str, width: u32, height: u32, scale: f64) -> Self {
         let phys_w = (width as f64 * scale) as u32;
@@ -85,8 +126,10 @@ impl Document {
             width,
             height,
             scale,
+            needs_paint: true,
             resource_provider: None,
             event_sink: None,
+            logger: None,
         }
     }
 
@@ -98,15 +141,60 @@ impl Document {
         self.event_sink = Some(sink);
     }
 
+    pub fn set_logger(&mut self, logger: Box<dyn Logger>) {
+        self.logger = Some(logger);
+    }
+
+    fn log_msg(&self, level: LogLevel, msg: fmt::Arguments<'_>) {
+        if let Some(ref l) = self.logger {
+            l.log(level, &fmt::format(msg));
+        }
+    }
+
     pub fn needs_repaint(&self) -> bool {
-        self.html_doc.has_changes() || self.html_doc.is_animating()
+        let result = self.needs_paint || self.html_doc.has_changes() || self.html_doc.is_animating();
+        self.log_msg(LogLevel::Trace, format_args!("[gguy] needs_repaint: needs_paint={} has_changes={} is_animating={} => {}", self.needs_paint, self.html_doc.has_changes(), self.html_doc.is_animating(), result));
+        result
     }
 
     pub fn reify(&mut self) {
-        self.html_doc.resolve(0.0);
+        let _t = Instant::now();
+
+        self.needs_paint = false;
+        self.html_doc.handle_messages();
+
+        let t = Instant::now();
+        self.html_doc.resolve_scroll_animation();
+        let scroll_us = t.elapsed().as_micros();
+
+        let t = Instant::now();
+        self.html_doc.resolve_stylist(0.0);
+        let style_us = t.elapsed().as_micros();
+
+        let t = Instant::now();
+        self.html_doc.resolve_layout_children();
+        let construct_us = t.elapsed().as_micros();
+
+        let t = Instant::now();
+        self.html_doc.resolve_deferred_tasks();
+        let deferred_us = t.elapsed().as_micros();
+
+        let root_id = self.html_doc.root_element().id;
+        let t = Instant::now();
+        self.html_doc.flush_styles_to_layout(root_id);
+        let flush_us = t.elapsed().as_micros();
+
+        let t = Instant::now();
+        self.html_doc.resolve_layout();
+        let layout_us = t.elapsed().as_micros();
+
+        self.log_msg(LogLevel::Profile, format_args!("[profile] reify: total={}µs  (scroll={} style={} construct={} deferred={} flush={} layout={})",
+            _t.elapsed().as_micros(),
+            scroll_us, style_us, construct_us, deferred_us, flush_us, layout_us));
     }
 
     pub fn paint_scene(&mut self) -> Scene {
+        let _t = Instant::now();
         let mut scene = Scene::new();
         let mut painter = VelloScenePainter::new(&mut scene);
 
@@ -119,6 +207,11 @@ impl Document {
             0,
             0,
         );
+
+        let elapsed = _t.elapsed();
+        if elapsed.as_micros() > 200 {
+            self.log_msg(LogLevel::Profile, format_args!("[profile] paint_scene: {}µs  ({}x{})", elapsed.as_micros(), self.width, self.height));
+        }
 
         scene
     }
@@ -133,7 +226,7 @@ impl Document {
 
         let viewport = Viewport::new(phys_w, phys_h, scale as f32, ColorScheme::Light);
         self.html_doc.set_viewport(viewport);
-        self.html_doc.resolve(0.0);
+        self.needs_paint = true;
     }
 
     pub fn handle_input_event(&mut self, event: &InputEvent) {
@@ -202,6 +295,321 @@ impl Document {
         };
 
         self.html_doc.handle_ui_event(ui_event);
-        self.html_doc.resolve(0.0);
+        self.needs_paint = true;
     }
+
+    // ── Query methods ──────────────────────────────────────────────────────
+
+    pub fn get_element_by_id(&self, id: &str) -> Option<usize> {
+        self.html_doc.get_element_by_id(id)
+    }
+
+    pub fn query_selector(&self, selector: &str) -> Option<usize> {
+        self.html_doc.query_selector(selector).ok()?
+    }
+
+    // ── Layer 1 mutation primitives ────────────────────────────────────────
+    //
+    // `_by_node_id` variants skip the id-lookup step (caller already resolved).
+    // `_by_id` variants are convenience wrappers for GDScript's Layer 1 API.
+
+    pub fn set_text_by_id(&mut self, id: &str, text: &str) {
+        let nid = self.html_doc.get_element_by_id(id);
+        if let Some(node_id) = nid {
+            self.set_text_by_node_id(node_id, text);
+        }
+    }
+
+    pub fn set_text_by_node_id(&mut self, node_id: usize, text: &str) {
+        let child_ids: Vec<usize> = self.html_doc
+            .get_node(node_id)
+            .map(|n| n.children.clone())
+            .unwrap_or_default();
+
+        let mut mutator = self.html_doc.mutate();
+        if let Some(&text_id) = child_ids.first() {
+            mutator.set_node_text(text_id, text);
+        } else {
+            let text_id = mutator.create_text_node(text);
+            mutator.append_children(node_id, &[text_id]);
+        }
+        drop(mutator);
+        self.needs_paint = true;
+    }
+
+    pub fn set_attribute_by_id(&mut self, id: &str, name: &str, value: &str) {
+        let nid = self.html_doc.get_element_by_id(id);
+        if let Some(node_id) = nid {
+            self.set_attribute_by_node_id(node_id, name, value);
+        }
+    }
+
+    pub fn set_attribute_by_node_id(&mut self, node_id: usize, name: &str, value: &str) {
+        let mut mutator = self.html_doc.mutate();
+        mutator.set_attribute(node_id, qual(name), value);
+        drop(mutator);
+        self.needs_paint = true;
+    }
+
+    pub fn remove_attribute_by_id(&mut self, id: &str, name: &str) {
+        let nid = self.html_doc.get_element_by_id(id);
+        if let Some(node_id) = nid {
+            self.remove_attribute_by_node_id(node_id, name);
+        }
+    }
+
+    pub fn remove_attribute_by_node_id(&mut self, node_id: usize, name: &str) {
+        let mut mutator = self.html_doc.mutate();
+        mutator.clear_attribute(node_id, qual(name));
+        drop(mutator);
+        self.needs_paint = true;
+    }
+
+    pub fn add_class_by_id(&mut self, id: &str, class: &str) {
+        let nid = self.html_doc.get_element_by_id(id);
+        if let Some(node_id) = nid {
+            self.add_class_by_node_id(node_id, class);
+        }
+    }
+
+    pub fn add_class_by_node_id(&mut self, node_id: usize, class: &str) {
+        let existing = self.html_doc
+            .get_node(node_id)
+            .and_then(|n| n.attr(local_name!("class")))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let mut classes: Vec<&str> = existing.split_whitespace().collect();
+        if classes.iter().any(|&c| c == class) {
+            return;
+        }
+        classes.push(class);
+        let new_value = classes.join(" ");
+
+        let mut mutator = self.html_doc.mutate();
+        mutator.set_attribute(node_id, qual("class"), &new_value);
+        drop(mutator);
+        self.needs_paint = true;
+    }
+
+    pub fn remove_class_by_id(&mut self, id: &str, class: &str) {
+        let nid = self.html_doc.get_element_by_id(id);
+        if let Some(node_id) = nid {
+            self.remove_class_by_node_id(node_id, class);
+        }
+    }
+
+    pub fn remove_class_by_node_id(&mut self, node_id: usize, class: &str) {
+        let existing = self.html_doc
+            .get_node(node_id)
+            .and_then(|n| n.attr(local_name!("class")))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let mut classes: Vec<&str> = existing.split_whitespace().collect();
+        classes.retain(|&c| c != class);
+        let new_value = classes.join(" ");
+
+        let mut mutator = self.html_doc.mutate();
+        mutator.set_attribute(node_id, qual("class"), &new_value);
+        drop(mutator);
+        self.needs_paint = true;
+    }
+
+    // ── Layer 0: VDOM reconciliation ──────────────────────────────────────
+
+    pub fn reconcile(
+        &mut self,
+        container_id: Option<&str>,
+        descriptors: &[NodeDescriptor],
+    ) {
+        let _t = Instant::now();
+
+        let container = container_id
+            .and_then(|id| self.html_doc.get_element_by_id(id))
+            .or_else(|| self.find_body());
+
+        let container_id = match container {
+            Some(cid) => cid,
+            None => {
+                self.log_msg(LogLevel::Warn, format_args!("[gguy] reconcile: no container found (body missing)"));
+                return;
+            }
+        };
+
+        let old_child_ids: Vec<usize> = self.html_doc
+            .get_node(container_id)
+            .map(|n| n.children.clone())
+            .unwrap_or_default();
+
+        let plans: Vec<Plan> = descriptors
+            .iter()
+            .map(|desc| Plan::resolve(desc, &self.html_doc))
+            .collect();
+
+        let plan_us = _t.elapsed().as_micros();
+
+        let mut mutator = self.html_doc.mutate();
+        let mut kept: HashSet<usize> = HashSet::new();
+        let mut new_order: Vec<usize> = Vec::new();
+
+        for plan in &plans {
+            if let Some(node_id) = plan.existing {
+                kept.insert(node_id);
+                new_order.push(node_id);
+                update_node(&mut mutator, node_id, plan);
+            } else {
+                let new_id = create_node_from_plan(&mut mutator, plan);
+                new_order.push(new_id);
+            }
+        }
+
+        for &old_id in &old_child_ids {
+            if !kept.contains(&old_id) {
+                mutator.remove_and_drop_node(old_id);
+            }
+        }
+
+        // Reorder children to match descriptor order: remove existing ones
+        // from current positions, then re-append all in the new order.
+        for &node_id in &new_order {
+            if kept.contains(&node_id) {
+                mutator.remove_node(node_id);
+            }
+        }
+        for &node_id in &new_order {
+            mutator.append_children(container_id, &[node_id]);
+        }
+
+        drop(mutator);
+
+        let mutate_us = _t.elapsed().as_micros() - plan_us;
+
+        self.needs_paint = true;
+
+        self.log_msg(LogLevel::Profile, format_args!("[profile] reconcile: total={}µs  plan={}µs  mutate={}µs  descs={}",
+            _t.elapsed().as_micros(), plan_us, mutate_us, descriptors.len()));
+    }
+
+    fn find_body(&self) -> Option<usize> {
+        self.html_doc.query_selector("body").ok()?
+    }
+}
+
+// ── Plan — a resolved descriptor with pre-computed id lookups ──────────────
+
+struct Plan {
+    existing: Option<usize>,
+    tag: String,
+    attrs: Vec<(String, String)>,
+    children: Vec<NodeDescriptor>,
+    is_text: bool,
+    text: Option<String>,
+}
+
+impl Plan {
+    fn resolve(desc: &NodeDescriptor, doc: &HtmlDocument) -> Self {
+        let id_attr = desc
+            .attrs
+            .iter()
+            .find(|(k, _)| k == "id")
+            .and_then(|(_, v)| doc.get_element_by_id(v));
+        Self {
+            existing: id_attr,
+            tag: desc.tag.clone(),
+            attrs: desc.attrs.clone(),
+            children: desc.children.clone(),
+            is_text: desc.text.is_some(),
+            text: desc.text.clone(),
+        }
+    }
+}
+
+// ── Plan application helpers (operate inside a mutator scope) ──────────────
+
+fn update_node(mutator: &mut blitz_dom::DocumentMutator, node_id: usize, plan: &Plan) {
+    for (name, value) in &plan.attrs {
+        mutator.set_attribute(node_id, qual(name), value);
+    }
+
+    let old_child_ids: Vec<usize> = mutator.child_ids(node_id);
+    let mut kept: HashSet<usize> = HashSet::new();
+
+    for child_desc in &plan.children {
+        let child_plan = Plan {
+            existing: child_desc
+                .attrs
+                .iter()
+                .find(|(k, _)| k == "id")
+                .and_then(|(_, id_val)| {
+                    old_child_ids.iter().copied().find(|&cid| {
+                        mutator
+                            .doc
+                            .get_node(cid)
+                            .and_then(|n| n.attr(local_name!("id")))
+                            .map(|a| a == id_val.as_str())
+                            .unwrap_or(false)
+                    })
+                }),
+            tag: child_desc.tag.clone(),
+            attrs: child_desc.attrs.clone(),
+            children: child_desc.children.clone(),
+            is_text: child_desc.text.is_some(),
+            text: child_desc.text.clone(),
+        };
+
+        let child_id = if let Some(cid) = child_plan.existing {
+            kept.insert(cid);
+            update_node(mutator, cid, &child_plan);
+            cid
+        } else {
+            let new_id = create_node_from_plan(mutator, &child_plan);
+            mutator.append_children(node_id, &[new_id]);
+            new_id
+        };
+
+        if child_plan.existing.is_some() {
+            mutator.remove_node(child_id);
+            mutator.append_children(node_id, &[child_id]);
+        }
+    }
+
+    for &cid in &old_child_ids {
+        if !kept.contains(&cid) {
+            mutator.remove_and_drop_node(cid);
+        }
+    }
+}
+
+fn create_node_from_plan(mutator: &mut blitz_dom::DocumentMutator, plan: &Plan) -> usize {
+    if plan.is_text {
+        let text = plan.text.as_deref().unwrap_or("");
+        return mutator.create_text_node(text);
+    }
+
+    let blitz_attrs: Vec<blitz_dom::Attribute> = plan
+        .attrs
+        .iter()
+        .map(|(name, value)| blitz_dom::Attribute {
+            name: qual(name),
+            value: value.clone(),
+        })
+        .collect();
+
+    let node_id = mutator.create_element(qual(&plan.tag), blitz_attrs);
+
+    for child in &plan.children {
+        let child_plan = Plan {
+            existing: None,
+            tag: child.tag.clone(),
+            attrs: child.attrs.clone(),
+            children: child.children.clone(),
+            is_text: child.text.is_some(),
+            text: child.text.clone(),
+        };
+        let child_id = create_node_from_plan(mutator, &child_plan);
+        mutator.append_children(node_id, &[child_id]);
+    }
+
+    node_id
 }

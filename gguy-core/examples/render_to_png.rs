@@ -84,7 +84,7 @@ fn main() {
     let phys_h = (height as f64 * scale) as u32;
 
     let mut doc = Document::new(html, width, height, scale);
-    let mut rt = RenderThread::new(phys_w, phys_h);
+    let mut rt = RenderThread::new(phys_w, phys_h, None);
 
     doc.reify();
     let scene = doc.paint_scene();

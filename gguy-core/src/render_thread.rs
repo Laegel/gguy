@@ -1,10 +1,13 @@
+use std::fmt;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use vello::Scene;
 use wgpu::TextureUsages;
 use wgpu_context::{BufferRenderer, BufferRendererConfig, WGPUContext};
 
+use crate::log::{LogEntry, LogLevel, Logger};
 use crate::output::{GpuTextureOutput, RenderOutput};
 
 // Number of ring-buffer texture slots for GPU interop.
@@ -20,10 +23,11 @@ struct ThreadedRenderer {
     current_slot: usize,
     width: u32,
     height: u32,
+    log_tx: Option<mpsc::Sender<LogEntry>>,
 }
 
 impl ThreadedRenderer {
-    fn new(width: u32, height: u32) -> Self {
+    fn new(width: u32, height: u32, log_tx: Option<mpsc::Sender<LogEntry>>) -> Self {
         let mut context = WGPUContext::new();
         let buffer_renderer = pollster::block_on(
             context.create_buffer_renderer(BufferRendererConfig {
@@ -57,6 +61,7 @@ impl ThreadedRenderer {
             current_slot: 0,
             width,
             height,
+            log_tx,
         }
     }
 
@@ -92,7 +97,14 @@ impl ThreadedRenderer {
         ring
     }
 
+    fn log_msg(&self, level: LogLevel, msg: fmt::Arguments<'_>) {
+        if let Some(ref tx) = self.log_tx {
+            let _ = tx.send((level, fmt::format(msg)));
+        }
+    }
+
     fn render_scene(&mut self, scene: &Scene, buffer: &mut [u8]) {
+        let _t = Instant::now();
         let size = self.buffer_renderer.size();
         self.vello_renderer
             .render_to_texture(
@@ -110,6 +122,11 @@ impl ThreadedRenderer {
             .expect("Vello render failed");
 
         self.buffer_renderer.copy_texture_to_buffer(buffer);
+
+        let elapsed = _t.elapsed();
+        if elapsed.as_micros() > 500 {
+            self.log_msg(LogLevel::Profile, format_args!("[profile] render_scene (vello+readback): {}µs", elapsed.as_micros()));
+        }
     }
 
     #[cfg(feature = "vulkan-interop")]
@@ -175,6 +192,7 @@ enum RenderCommand {
     #[cfg_attr(not(feature = "vulkan-interop"), allow(dead_code))]
     RenderGpu(Scene, u32, u32),
     Resize(u32, u32),
+    Unblock,
     Shutdown,
 }
 
@@ -182,20 +200,42 @@ pub struct RenderThread {
     cmd_tx: mpsc::Sender<RenderCommand>,
     result_rx: mpsc::Receiver<RenderOutput>,
     gpu_result_rx: mpsc::Receiver<GpuTextureOutput>,
+    resize_ack_rx: mpsc::Receiver<()>,
+    log_rx: Option<mpsc::Receiver<LogEntry>>,
+    main_logger: Option<Box<dyn Logger>>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl RenderThread {
-    pub fn new(width: u32, height: u32) -> Self {
+    pub fn new(width: u32, height: u32, logger: Option<Box<dyn Logger>>) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<RenderCommand>();
         let (result_tx, result_rx) = mpsc::channel::<RenderOutput>();
         #[cfg_attr(not(feature = "vulkan-interop"), allow(unused))]
         let (gpu_result_tx, gpu_result_rx) = mpsc::channel::<GpuTextureOutput>();
+        let (resize_ack_tx, resize_ack_rx) = mpsc::channel::<()>();
+
+        let (log_tx, log_rx) = logger
+            .as_ref()
+            .map(|_| {
+                let (tx, rx) = mpsc::channel::<LogEntry>();
+                (Some(tx), Some(rx))
+            })
+            .unwrap_or((None, None));
 
         let handle = thread::spawn(move || {
-            let mut renderer = ThreadedRenderer::new(width, height);
+            let mut renderer = ThreadedRenderer::new(width, height, log_tx);
+            let mut parked = false;
 
             while let Ok(cmd) = cmd_rx.recv() {
+                if parked {
+                    match cmd {
+                        RenderCommand::Unblock => parked = false,
+                        RenderCommand::Shutdown => break,
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match cmd {
                     RenderCommand::Render(scene, w, h) => {
                         let size = w as usize * h as usize * 4;
@@ -219,7 +259,10 @@ impl RenderThread {
                     }
                     RenderCommand::Resize(w, h) => {
                         renderer.resize(w, h);
+                        let _ = resize_ack_tx.send(());
+                        parked = true;
                     }
+                    RenderCommand::Unblock => {}
                     RenderCommand::Shutdown => break,
                 }
             }
@@ -229,6 +272,9 @@ impl RenderThread {
             cmd_tx,
             result_rx,
             gpu_result_rx,
+            resize_ack_rx,
+            log_rx,
+            main_logger: logger,
             handle: Some(handle),
         }
     }
@@ -254,6 +300,38 @@ impl RenderThread {
 
     pub fn resize(&self, width: u32, height: u32) {
         let _ = self.cmd_tx.send(RenderCommand::Resize(width, height));
+    }
+
+    /// Blocking resize with full pipeline drain.
+    ///
+    /// 1. Sends `Resize` to the worker.
+    /// 2. Waits for the worker to finish any in-flight frame, process the resize,
+    ///    and park itself.
+    /// 3. Drains any stale results that were produced before the resize.
+    /// 4. Sends `Unblock` so the worker resumes accepting new render requests.
+    pub fn resize_sync(&mut self, width: u32, height: u32) {
+        let _ = self.cmd_tx.send(RenderCommand::Resize(width, height));
+        let _ = self.resize_ack_rx.recv();
+        // Drain stale results produced before the resize took effect.
+        while self.result_rx.try_recv().is_ok() {}
+        while self.gpu_result_rx.try_recv().is_ok() {}
+        let _ = self.cmd_tx.send(RenderCommand::Unblock);
+    }
+
+    /// Drain pending log messages from the render thread and forward them to the
+    /// main-thread logger. Call this from the main thread (e.g. in `process()`).
+    pub fn drain_logs(&mut self) {
+        let rx = match self.log_rx.as_mut() {
+            Some(rx) => rx,
+            None => return,
+        };
+        let logger = match self.main_logger.as_ref() {
+            Some(l) => l,
+            None => return,
+        };
+        while let Ok((level, msg)) = rx.try_recv() {
+            logger.log(level, &msg);
+        }
     }
 }
 

@@ -1,8 +1,11 @@
+use std::time::Instant;
+
 use gguy_core::input::{PointerButton, PointerCoords};
+use gguy_core::log::{LogLevel, Logger};
 use gguy_core::{Document, InputEvent, RenderThread};
 #[cfg(feature = "vulkan-interop")]
 use gguy_core::GpuTextureOutput;
-use godot::builtin::GString;
+use godot::builtin::{GString, VarDictionary};
 #[cfg(not(feature = "vulkan-interop"))]
 use godot::classes::image::Format;
 #[cfg(not(feature = "vulkan-interop"))]
@@ -19,6 +22,8 @@ use godot::prelude::*;
 #[cfg(feature = "vulkan-interop")]
 use godot::builtin::Rid;
 
+mod api;
+
 fn map_mouse_button(btn: MouseButton) -> PointerButton {
     let ord = btn.ord();
     if ord == MouseButton::LEFT.ord() {
@@ -33,6 +38,18 @@ fn map_mouse_button(btn: MouseButton) -> PointerButton {
         PointerButton::Forward
     } else {
         PointerButton::Other(ord as u8)
+    }
+}
+
+struct GodotLogger;
+
+impl Logger for GodotLogger {
+    fn log(&self, level: LogLevel, message: &str) {
+        match level {
+            LogLevel::Error => godot_error!("{}", message),
+            LogLevel::Profile | LogLevel::Warn | LogLevel::Info => godot_print!("{}", message),
+            LogLevel::Debug | LogLevel::Trace => {}
+        }
     }
 }
 
@@ -64,9 +81,10 @@ impl GguySurface {
         let html_str = html.to_string();
         let phys_w = (self.width as f64 * self.scale) as u32;
         let phys_h = (self.height as f64 * self.scale) as u32;
-        let doc = Document::new(&html_str, self.width, self.height, self.scale);
+        let mut doc = Document::new(&html_str, self.width, self.height, self.scale);
+        doc.set_logger(Box::new(GodotLogger));
         self.document = Some(doc);
-        self.render_thread = Some(RenderThread::new(phys_w, phys_h));
+        self.render_thread = Some(RenderThread::new(phys_w, phys_h, Some(Box::new(GodotLogger))));
     }
 
     #[cfg(feature = "vulkan-interop")]
@@ -111,10 +129,13 @@ impl GguySurface {
         if let Some(ref mut doc) = self.document {
             doc.resize(self.width, self.height, self.scale);
         }
-        if let Some(ref rt) = self.render_thread {
+        if let Some(ref mut rt) = self.render_thread {
             let phys_w = (self.width as f64 * self.scale) as u32;
             let phys_h = (self.height as f64 * self.scale) as u32;
-            rt.resize(phys_w, phys_h);
+            rt.resize_sync(phys_w, phys_h);
+            // Drain already discarded stale results.  The old texture (at the
+            // old size) lives for one more frame — a one-frame stutter — then
+            // gets replaced naturally by the next render.
         }
     }
 
@@ -135,7 +156,52 @@ impl GguySurface {
         self.gpu_texture.clone().unwrap_or_else(Texture2Drd::new_gd)
     }
 
+    // ── Layer 0: VDOM diff layer ──────────────────────────────────────────
+
+    #[func]
+    pub fn render(&mut self, tree: VarDictionary) {
+        api::layer0_vdom::render(self, tree);
+    }
+
+    #[func]
+    pub fn render_into(&mut self, container_id: GString, tree: VarDictionary) {
+        api::layer0_vdom::render_into(self, &container_id.to_string(), tree);
+    }
+
+    // ── Layer 1: Low-level mutation API ────────────────────────────────────
+
+    #[func]
+    pub fn set_text(&mut self, selector: GString, value: GString) {
+        api::layer1_mutation::set_text(self, &selector.to_string(), &value.to_string());
+    }
+
+    #[func]
+    pub fn set_attribute(&mut self, selector: GString, name: GString, value: GString) {
+        api::layer1_mutation::set_attribute(self, &selector.to_string(), &name.to_string(), &value.to_string());
+    }
+
+    #[func]
+    pub fn remove_attribute(&mut self, selector: GString, name: GString) {
+        api::layer1_mutation::remove_attribute(self, &selector.to_string(), &name.to_string());
+    }
+
+    #[func]
+    pub fn add_class(&mut self, selector: GString, class: GString) {
+        api::layer1_mutation::add_class(self, &selector.to_string(), &class.to_string());
+    }
+
+    #[func]
+    pub fn remove_class(&mut self, selector: GString, class: GString) {
+        api::layer1_mutation::remove_class(self, &selector.to_string(), &class.to_string());
+    }
+
     fn update_texture(&mut self) {
+        if let Some(rt) = self.render_thread.as_mut() {
+            rt.drain_logs();
+        }
+        let _t_total = Instant::now();
+        let mut tex_created = false;
+
         #[cfg(feature = "vulkan-interop")]
         {
             // GPU hand-off path: poll for GPU texture output first.
@@ -144,8 +210,11 @@ impl GguySurface {
                 .as_mut()
                 .and_then(|rt| rt.try_recv_gpu())
             {
+                let t = Instant::now();
                 let tex = self.create_gpu_texture(gpu_output);
                 self.gpu_texture = Some(tex);
+                godot_print!("[profile] texture_create: {}µs", t.elapsed().as_micros());
+                tex_created = true;
             }
         }
 
@@ -157,12 +226,23 @@ impl GguySurface {
                 .as_mut()
                 .and_then(|rt| rt.try_recv())
             {
+                let t = Instant::now();
                 if output.is_empty() {
                     return;
                 }
 
-                let mut pba = PackedByteArray::new();
-                pba.extend(output.bytes().iter().copied());
+                let expected = output.width() as usize * output.height() as usize * 4;
+                debug_assert_eq!(
+                    output.bytes().len(),
+                    expected,
+                    "RenderOutput buffer size mismatch"
+                );
+                let expected_w = (self.width as f64 * self.scale) as u32;
+                let expected_h = (self.height as f64 * self.scale) as u32;
+                debug_assert_eq!(output.width(), expected_w, "output width mismatch");
+                debug_assert_eq!(output.height(), expected_h, "output height mismatch");
+
+                let pba = PackedByteArray::from(output.bytes());
 
                 let img = Image::create_from_data(
                     output.width() as i32,
@@ -173,10 +253,18 @@ impl GguySurface {
                 );
 
                 if let Some(image) = img {
-                    let mut tex = ImageTexture::new_gd();
-                    tex.set_image(&image);
-                    self.texture = Some(tex);
+                    tex_created = true;
+                    match self.texture.as_mut() {
+                        Some(tex) => tex.update(&image),
+                        None => {
+                            let mut tex = ImageTexture::new_gd();
+                            tex.set_image(&image);
+                            self.texture = Some(tex);
+                        }
+                    }
                 }
+
+                godot_print!("[profile] texture_create: {}µs", t.elapsed().as_micros());
             }
         }
 
@@ -196,9 +284,15 @@ impl GguySurface {
             });
 
         if needs_repaint {
+            let t = Instant::now();
             let doc = self.document.as_mut().unwrap();
             doc.reify();
+            let reify_us = t.elapsed().as_micros();
+
+            let t = Instant::now();
             let scene = doc.paint_scene();
+            let paint_us = t.elapsed().as_micros();
+
             let phys_w = (self.width as f64 * self.scale) as u32;
             let phys_h = (self.height as f64 * self.scale) as u32;
             if let Some(rt) = self.render_thread.as_ref() {
@@ -207,6 +301,9 @@ impl GguySurface {
                 #[cfg(not(feature = "vulkan-interop"))]
                 rt.send_scene(scene, phys_w, phys_h);
             }
+
+            godot_print!("[profile] update_texture: total={}µs  reify={}µs  paint={}µs  tex={}",
+                _t_total.elapsed().as_micros(), reify_us, paint_us, if tex_created { "yes" } else { "no" });
         }
     }
 }

@@ -1,7 +1,6 @@
-[gd_scene load_steps=3 format=3 uid="uid://d0oq7nbo0r4k0"]
+[gd_scene load_steps=3 format=3 uid="uid://vd0md3m0"]
 
-[ext_resource type="Script" uid="uid://bgu0yyytgp5jh" path="res://main.gd" id="1_p23xc"]
-[ext_resource type="Script" uid="uid://tws2n5jqij5k" path="res://ui_layer2.gd" id="2_0xm2m"]
+[ext_resource type="Script" path="res://vdom_demo.gd" id="1_p23xc"]
 
 [node name="Control" type="Control"]
 layout_mode = 3
@@ -24,5 +23,6 @@ stretch_mode = 2
 
 [node name="GguySurface" type="GguySurface" parent="."]
 
-[node name="Node" type="Node" parent="."]
-script = ExtResource("2_0xm2m")
+[node name="TickTimer" type="Timer" parent="."]
+wait_time = 0.5
+autostart = true

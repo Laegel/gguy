@@ -1,10 +1,11 @@
 pub mod document;
 pub mod input;
+pub mod log;
 pub mod output;
 pub mod render_thread;
 pub mod traits;
 
-pub use document::Document;
+pub use document::{Document, NodeDescriptor};
 pub use input::InputEvent;
 pub use output::GpuTextureOutput;
 pub use output::RenderOutput;
